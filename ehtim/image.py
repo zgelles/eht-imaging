@@ -1032,8 +1032,8 @@ class Image(object):
             frac = np.sum(np.abs(self.rrvec - self.llvec)) / np.abs(np.sum(self.rrvec + self.llvec))
 
         return frac
-
-    def betamodes(self, ms=[2], r_min=0, r_max=None, verbose=True):
+    
+    def betamodes(self, ms=[2], r_min=0, r_max=None, verbose=True, usecart=True, nr=None, minphi=0, maxphi=2*np.pi):
         """Return Palumbo+2020 linear beta_m modes integrated between image radius r_min, r_max
            Does not center the image
            
@@ -1043,51 +1043,146 @@ class Image(object):
                 r_max (float): maximum image radius for calculation (in rad). 
                                if None, use the full image
                 verbose (bool): print details
+                usecart (bool): True if original Cartesian computation, false to interpolate onto a polar grid
+                nr (int): number of impact parameters (if usecart==False)
+                minphi/maxphi (float): range of image varphi's (measured CCW from North) along which to integrate
            Returns:
                 (list) : beta_m modes matching input list ms
         """
         if not (isinstance(ms, np.ndarray) or isinstance(ms, list)):
             ms = [ms]
-        
         if self.polrep == 'stokes':
             parr = (self.qvec + 1j*self.uvec).reshape(self.ydim, self.xdim)
             iarr = self.imvec.reshape(self.ydim, self.xdim)
         elif self.polrep == 'circ':
             parr = self.rlvec.reshape(self.ydim, self.xdim)
             iarr = (0.5*(self.rrvec + self.llvec)).reshape(self.ydim, self.xdim)
+          
+        #use original formulation in Cartesian image coordinates  
+        if usecart:
+            # get angles measured East of North (corresponding to above conventions for EB modes)
+            s, t = np.meshgrid(np.flip(np.fft.fftshift(np.fft.fftfreq(self.xdim, d=1.0 / self.xdim))),
+                            np.flip(np.fft.fftshift(np.fft.fftfreq(self.ydim, d=1.0 / self.ydim))))
+            s = s + .5  # .5 offset to reference to pixel center
+            t = t + .5  # .5 offset to reference to pixel center
+            
+            imdist = np.sqrt(s**2 + t**2) # distance from the center in pixels
+            imangle = np.arctan2(s, t)
+            imangle[imangle<0.] += 2.*np.pi
 
-        # get angles measured East of North (corresponding to above conventions for EB modes)
-        s, t = np.meshgrid(np.flip(np.fft.fftshift(np.fft.fftfreq(self.xdim, d=1.0 / self.xdim))),
-                           np.flip(np.fft.fftshift(np.fft.fftfreq(self.ydim, d=1.0 / self.ydim))))
-        s = s + .5  # .5 offset to reference to pixel center
-        t = t + .5  # .5 offset to reference to pixel center
+            # define masked region
+            if (r_min is not None) and (r_max is not None):
+                if verbose: print ("restricting betamodes to annulus between %.2f to %.2f uas!"%(r_min/ehc.RADPERUAS, r_max/ehc.RADPERUAS))
+                mask = (imdist<=(r_max/self.psize)) * (imdist>=(r_min/self.psize))
+            else:
+                mask = np.ones(iarr.shape).astype(bool)
+            
+            # total flux in annulus
+            flux = np.abs(np.sum(iarr[mask])) 
+            
+            # compute beta modes
+            outlist = []
+            for m in ms:
+                
+                if not isinstance(m,int):
+                    raise Exception("each element of 'ms' should be an integer in betamodes!")
+                    
+                integrand = (parr*np.exp(-1j*m*imangle))[mask]
+                coeff = np.sum(integrand)/flux
+                outlist.append(coeff)
+                
+            return outlist
         
-        imdist = np.sqrt(s**2 + t**2) # distance from the center in pixels
-        imangle = np.arctan2(s, t)
-        imangle[imangle<0.] += 2.*np.pi
-
-        # define masked region
-        if (r_min is not None) and (r_max is not None):
-            if verbose: print ("restricting betamodes to annulus between %.2f to %.2f uas!"%(r_min/ehc.RADPERUAS, r_max/ehc.RADPERUAS))
-            mask = (imdist<=(r_max/self.psize)) * (imdist>=(r_min/self.psize))
+        #interpolate onto a polar grid
         else:
-            mask = np.ones(iarr.shape).astype(bool)
-        
-        # total flux in annulus
-        flux = np.abs(np.sum(iarr[mask])) 
-        
-        # compute beta modes
-        outlist = []
-        for m in ms:
+            #define image array in terms of uas
+            npix = self.xdim
+            fov_muas = self.fovx()/ehc.RADPERUAS
+            pxi = (np.arange(npix))/npix-0.5
+            pxi += (pxi[1]-pxi[0])/2
+            pxj = np.copy(pxi)
+            mui = pxi*fov_muas
+            muj = pxj*fov_muas
             
-            if not isinstance(m,int):
-                raise Exception("each element of 'ms' should be an integer in betamodes!")
+            #define values of impact parameter and image phi we will need
+            if nr == None: #set default number of R values to be the number of pixels between r_min and r_max
+                nr = int((r_max-r_min)/self.psize)
+            Reven = np.linspace(r_min/ehc.RADPERUAS,r_max/ehc.RADPERUAS,nr)
+            phieven = np.arange(minphi,maxphi,2*np.pi/nr)
+            
+            #define interpolating functions of Q,U
+            qarr = np.real(parr)
+            uarr = np.imag(parr)
+            interp_Q = scipy.interpolate.RegularGridInterpolator((mui, muj), qarr)
+            interp_U = scipy.interpolate.RegularGridInterpolator((mui, muj), uarr)
+            
+            #compute arbb2 directly from the integral in varphi
+            betavals = [[] for m in ms]
+            unitcoords = np.array([[-np.cos(phi),-np.sin(phi)] for phi in phieven])
+            for R in Reven:
+                coords = R*unitcoords
+                Phere = interp_Q(coords)+1j*interp_U(coords)
+                for mind in range(len(ms)):
+                    integrand = Phere*np.exp(-ms[mind]*1j*phieven)
+                    betavals[mind].append(np.sum(integrand)/2*np.pi)
+            b2 = np.array(betavals)
+            return Reven, b2
+        
+    # def betamodes(self, ms=[2], r_min=0, r_max=None, verbose=True):
+    #     """Return Palumbo+2020 linear beta_m modes integrated between image radius r_min, r_max
+    #        Does not center the image
+           
+    #        Args:
+    #             ms : list of integers m to compute beta modes for
+    #             r_min (float): minimum image radius for calculation (in rad)
+    #             r_max (float): maximum image radius for calculation (in rad). 
+    #                            if None, use the full image
+    #             verbose (bool): print details
+    #        Returns:
+    #             (list) : beta_m modes matching input list ms
+    #     """
+    #     if not (isinstance(ms, np.ndarray) or isinstance(ms, list)):
+    #         ms = [ms]
+        
+    #     if self.polrep == 'stokes':
+    #         parr = (self.qvec + 1j*self.uvec).reshape(self.ydim, self.xdim)
+    #         iarr = self.imvec.reshape(self.ydim, self.xdim)
+    #     elif self.polrep == 'circ':
+    #         parr = self.rlvec.reshape(self.ydim, self.xdim)
+    #         iarr = (0.5*(self.rrvec + self.llvec)).reshape(self.ydim, self.xdim)
+
+    #     # get angles measured East of North (corresponding to above conventions for EB modes)
+    #     s, t = np.meshgrid(np.flip(np.fft.fftshift(np.fft.fftfreq(self.xdim, d=1.0 / self.xdim))),
+    #                        np.flip(np.fft.fftshift(np.fft.fftfreq(self.ydim, d=1.0 / self.ydim))))
+    #     s = s + .5  # .5 offset to reference to pixel center
+    #     t = t + .5  # .5 offset to reference to pixel center
+        
+    #     imdist = np.sqrt(s**2 + t**2) # distance from the center in pixels
+    #     imangle = np.arctan2(s, t)
+    #     imangle[imangle<0.] += 2.*np.pi
+
+    #     # define masked region
+    #     if (r_min is not None) and (r_max is not None):
+    #         if verbose: print ("restricting betamodes to annulus between %.2f to %.2f uas!"%(r_min/ehc.RADPERUAS, r_max/ehc.RADPERUAS))
+    #         mask = (imdist<=(r_max/self.psize)) * (imdist>=(r_min/self.psize))
+    #     else:
+    #         mask = np.ones(iarr.shape).astype(bool)
+        
+    #     # total flux in annulus
+    #     flux = np.abs(np.sum(iarr[mask])) 
+        
+    #     # compute beta modes
+    #     outlist = []
+    #     for m in ms:
+            
+    #         if not isinstance(m,int):
+    #             raise Exception("each element of 'ms' should be an integer in betamodes!")
                  
-            integrand = (parr*np.exp(-1j*m*imangle))[mask]
-            coeff = np.sum(integrand)/flux
-            outlist.append(coeff)
+    #         integrand = (parr*np.exp(-1j*m*imangle))[mask]
+    #         coeff = np.sum(integrand)/flux
+    #         outlist.append(coeff)
             
-        return outlist
+    #     return outlist
 
 
     def center(self, pol=None):
